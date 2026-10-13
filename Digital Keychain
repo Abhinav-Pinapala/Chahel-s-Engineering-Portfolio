@@ -1,0 +1,542 @@
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <time.h>
+#include "esp_sntp.h"
+#include "driver/rtc_io.h"
+#include "driver/gpio.h"
+
+// ---------- CONFIG ----------
+const char* WIFI_SSID = "YOUR_HOTSPOT";
+const char* WIFI_PASS = "YOUR_PASSWORD";
+const char* TZ_INFO   = "EST5EDT,M3.2.0,M11.1.0";   // US Eastern, handles DST
+
+const int PIN_BL   = 4;
+const int PIN_BTN  = 0;    // left: short = screen on/off, long = sync
+const int PIN_BTN2 = 35;   // right: next emotion
+const int PIN_VBAT = 34;   // battery voltage through a 2:1 divider
+const float VBAT_CAL = 1.00f;   // adjust after comparing with a multimeter
+const uint32_t LONG_PRESS_MS = 1500;
+
+// ---- bench-testing switches ----
+const bool BATTERY_CHECKS = true;    // set false when testing on USB with no battery connected
+const bool DEBUG_SERIAL   = true;    // prints to Serial Monitor at 115200 baud
+const bool FAST_TEST      = false;   // true = neutral rests of 3-8 s instead of 30 s to 5 min
+
+#define DBG(...) do { if (DEBUG_SERIAL) Serial.printf(__VA_ARGS__); } while (0)
+
+TFT_eSPI tft;
+TFT_eSprite spr(&tft);
+
+// ---------- EMOTIONS ----------
+enum Emo : uint8_t {
+  E_NEUTRAL, E_HAPPY, E_SAD, E_ANGRY, E_SURPRISED, E_LOVE, E_SLEEPY, E_WINK,
+  E_SUSPICIOUS, E_SMUG, E_CRY, E_DIZZY, E_DEAD, E_EXCITED, E_CONFUSED,
+  E_SCARED, E_LAUGH, E_ASLEEP, E_COUNT
+};
+const char* EMO_NAMES[E_COUNT] = {
+  "neutral", "happy", "sad", "angry", "surprised", "love", "sleepy", "wink",
+  "suspicious", "smug", "cry", "dizzy", "dead", "excited", "confused",
+  "scared", "laugh", "asleep"
+};
+enum Special : uint8_t { SP_NONE, SP_HEART, SP_STAR, SP_SPIRAL, SP_X, SP_ASLEEP };
+
+struct Look {
+  uint16_t color; int8_t tilt; uint8_t lid;
+  bool arch, wink, tear;
+  Special sp; uint8_t shake; int8_t bias; uint8_t asym;
+  float scaleH, scaleW, gaze;
+};
+// tilt: +1 inner corners lowered (angry), -1 outer corners lowered (sad)
+// lid: % of eye height covered by a flat top lid; asym: right eye height in %
+//                color   tilt lid arch  wink  tear  special    shk bias asym  H    W    gaze
+const Look LOOKS[E_COUNT] = {
+  /* NEUTRAL    */ {0x07FF,  0,  0, false,false,false, SP_NONE,   0,  0, 100, 1.0, 1.0, 1.0},
+  /* HAPPY      */ {0x07FF,  0,  0, true, false,false, SP_NONE,   0,  0, 100, 1.0, 1.0, 0.6},
+  /* SAD        */ {0x5D1F, -1,  0, false,false,false, SP_NONE,   0,  0, 100, 0.95,1.0, 0.5},
+  /* ANGRY      */ {0xFA25,  1,  0, false,false,false, SP_NONE,   0,  0, 100, 0.9, 1.0, 0.3},
+  /* SURPRISED  */ {0x07FF,  0,  0, false,false,false, SP_NONE,   0,  0, 100, 1.2, 0.8, 0.3},
+  /* LOVE       */ {0xFA92,  0,  0, false,false,false, SP_HEART,  0,  0, 100, 1.0, 1.0, 0.0},
+  /* SLEEPY     */ {0x07FF,  0,  0, false,false,false, SP_NONE,   0,  0, 100, 0.5, 1.0, 0.4},
+  /* WINK       */ {0x07FF,  0,  0, false,true, false, SP_NONE,   0,  0, 100, 1.0, 1.0, 0.6},
+  /* SUSPICIOUS */ {0x07FF,  0, 40, false,false,false, SP_NONE,   0, 20, 100, 1.0, 1.0, 0.2},
+  /* SMUG       */ {0x07FF,  0, 35, true, false,false, SP_NONE,   0,  0, 100, 1.0, 1.0, 0.4},
+  /* CRY        */ {0x5D1F, -1,  0, false,false,true,  SP_NONE,   0,  0, 100, 0.9, 1.0, 0.2},
+  /* DIZZY      */ {0x07FF,  0,  0, false,false,false, SP_SPIRAL, 0,  0, 100, 1.0, 1.0, 0.0},
+  /* DEAD (X)   */ {0xFA25,  0,  0, false,false,false, SP_X,      0,  0, 100, 1.0, 1.0, 0.0},
+  /* EXCITED    */ {0xFEE0,  0,  0, false,false,false, SP_STAR,   0,  0, 100, 1.0, 1.0, 0.0},
+  /* CONFUSED   */ {0x07FF,  0,  0, false,false,false, SP_NONE,   0,  0,  55, 1.0, 1.0, 0.8},
+  /* SCARED     */ {0xFFFF,  0,  0, false,false,false, SP_NONE,   1,  0, 100, 1.1, 0.55,0.5},
+  /* LAUGH      */ {0x07FF,  0,  0, true, false,false, SP_NONE,   1,  0, 100, 1.0, 1.0, 0.0},
+  /* ASLEEP     */ {0x07FF,  0,  0, false,false,false, SP_ASLEEP, 0,  0, 100, 1.0, 1.0, 0.0},
+};
+
+// ---------- TIME-OF-DAY MOODS ----------
+// Neutral is the resting face, so it isn't in the pools.
+const Emo POOL_MORNING[] = {E_SLEEPY, E_HAPPY, E_WINK, E_CONFUSED};
+const Emo POOL_MIDDAY[]  = {E_HAPPY, E_LAUGH, E_EXCITED, E_SURPRISED, E_LOVE, E_WINK,
+                            E_SMUG, E_SUSPICIOUS, E_CONFUSED, E_DIZZY, E_ANGRY, E_SAD, E_SCARED, E_CRY};
+const Emo POOL_EVENING[] = {E_HAPPY, E_LOVE, E_SLEEPY, E_SAD, E_SMUG, E_CONFUSED, E_LAUGH};
+const Emo POOL_NIGHT[]   = {E_SLEEPY, E_ASLEEP, E_ASLEEP};
+const Emo POOL_LOW[]     = {E_SLEEPY, E_SAD, E_CRY, E_SLEEPY, E_SCARED};
+#define N(a) (sizeof(a) / sizeof(a[0]))
+
+struct Mood {
+  float maxOpen; uint16_t blinkMin, blinkMax;
+  const Emo* pool; uint8_t n; uint16_t durMin, durMax; bool slow;
+};
+Mood mood = {1.0, 2000, 5000, POOL_MIDDAY, N(POOL_MIDDAY), 4000, 9000, false};
+
+int brightnessForTime(int t) {            // t = minutes since midnight
+  if (t >= 420 && t < 570)  return 20;    // 7:00-9:30
+  if (t >= 570 && t < 960)  return 70;    // 9:30-16:00
+  if (t >= 960 && t < 1200) return 20;    // 16:00-20:00
+  return 5;                               // 20:00-7:00
+}
+
+Mood moodForTime(int t) {
+  if (t >= 420 && t < 570)  return {0.85, 3000, 6000, POOL_MORNING, N(POOL_MORNING), 5000, 10000, false};
+  if (t >= 570 && t < 960)  return {1.0,  2000, 5000, POOL_MIDDAY,  N(POOL_MIDDAY),  4000, 9000,  false};
+  if (t >= 960 && t < 1200) return {0.9,  3000, 6000, POOL_EVENING, N(POOL_EVENING), 5000, 10000, false};
+  return {0.7, 5000, 10000, POOL_NIGHT, N(POOL_NIGHT), 10000, 20000, true};
+}
+
+// ---------- STATE ----------
+RTC_DATA_ATTR bool timeValid = false;      // survives deep sleep, lost on full power loss
+bool screenOn = true, dirty = true, hasPending = false, showingClock = false;
+int brightPct = 20;
+volatile bool ntpDone = false;
+const char* statusMsg = "";
+uint32_t statusUntil = 0, sleepAt = 0;
+
+float battV = 4.0f; int battPct = 100;
+bool battLow = false, battCrit = false;
+
+Emo emo = E_NEUTRAL, pendingEmo = E_NEUTRAL;
+float openCur = 1, openTarget = 1, sf = 1;
+float gazeX = 0, gazeY = 0, gazeTX = 0, gazeTY = 0;
+uint32_t blinkUntil = 0, nextBlink = 0, nextGaze = 0, nextEmo = 0, lastCheck = 0;
+
+int S(int v) { return max(1, (int)(v * sf)); }   // blink-scaled size for special shapes
+
+void applyBacklight() {
+  ledcWrite(PIN_BL, screenOn ? map(brightPct, 0, 100, 0, 255) : 0);
+}
+
+// ---------- BATTERY ----------
+float readBattV() {
+  uint32_t sum = 0;
+  for (int i = 0; i < 16; i++) { sum += analogReadMilliVolts(PIN_VBAT); delay(2); }
+  return (sum / 16.0f) * 2.0f * VBAT_CAL / 1000.0f;
+}
+
+int battPercent(float v) {   // rough LiPo curve
+  static const float V[] = {3.30, 3.50, 3.60, 3.70, 3.80, 3.90, 4.00, 4.10, 4.20};
+  static const int   P[] = {0,    5,    10,   20,   35,   50,   70,   88,   100};
+  if (v <= V[0]) return 0;
+  if (v >= V[8]) return 100;
+  for (int i = 1; i < 9; i++)
+    if (v < V[i]) return P[i - 1] + (int)((P[i] - P[i - 1]) * (v - V[i - 1]) / (V[i] - V[i - 1]));
+  return 100;
+}
+
+void queueEmotion(Emo e, uint32_t holdMs);
+
+void updateBattery() {
+  if (!BATTERY_CHECKS) return;               // bench testing without a battery
+  static uint8_t critCount = 0;
+  bool wasLow = battLow, wasCrit = battCrit;
+  int oldPct = battPct;
+
+  battV = readBattV();
+  battPct = battPercent(battV);
+  DBG("battery: %.2f V, %d%%\n", battV, battPct);
+
+  if (!battLow && battV < 3.65f) battLow = true;           // about 15%
+  else if (battLow && battV > 3.75f) battLow = false;      // clears when charging
+
+  if (battV < 3.35f) { if (++critCount >= 3) battCrit = true; }   // about 2%, 3 reads in a row
+  else { critCount = 0; if (battV > 3.5f) battCrit = false; }
+
+  if (battCrit && !sleepAt) {
+    DBG("battery critical: sleeping in 6 s\n");
+    sleepAt = millis() + 6000;
+    queueEmotion(E_DEAD, 60000);
+  }
+  if (!battCrit) sleepAt = 0;
+  if (battLow != wasLow) nextEmo = millis();               // switch emotion pool right away
+  if (battLow != wasLow || battCrit != wasCrit || battPct != oldPct) dirty = true;
+}
+
+void goToSleep() {
+  DBG("going to deep sleep\n");
+  tft.writecommand(0x28);                     // display off
+  tft.writecommand(0x10);                     // panel sleep
+  ledcDetach(PIN_BL);
+  pinMode(PIN_BL, OUTPUT);
+  digitalWrite(PIN_BL, LOW);
+  gpio_hold_en((gpio_num_t)PIN_BL);           // keep backlight off while asleep
+  gpio_deep_sleep_hold_en();
+  rtc_gpio_pullup_en(GPIO_NUM_0);
+  rtc_gpio_pulldown_dis(GPIO_NUM_0);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);   // left button wakes it
+  esp_deep_sleep_start();
+}
+
+// brightness + mood for the current time of day
+void updateSchedule() {
+  struct tm tm;
+  int t = -1;
+  if (timeValid && getLocalTime(&tm, 0)) t = tm.tm_hour * 60 + tm.tm_min;
+  brightPct = (t < 0) ? 20 : brightnessForTime(t);
+  mood = moodForTime(t < 0 ? 600 : t);
+
+  if (battLow) { mood.pool = POOL_LOW; mood.n = N(POOL_LOW); mood.slow = true; }
+  if (battCrit) brightPct = min(brightPct, 5);
+  else if (battLow) brightPct = min(brightPct, 20);
+  applyBacklight();
+}
+
+// ---------- EMOTION CONTROL ----------
+void queueEmotion(Emo e, uint32_t holdMs) {
+  uint32_t now = millis();
+  nextEmo = now + holdMs;
+  if (e == emo && !hasPending) return;
+  pendingEmo = e; hasPending = true;
+  if (blinkUntil < now + 350) blinkUntil = now + 350;   // swap happens mid-blink
+}
+
+// how long the eyes stay neutral between emotions
+uint32_t restTime() {
+  if (FAST_TEST) return random(3000, 8000);
+  static const uint32_t R[] = {30000, 30000, 60000, 60000, 300000};   // 30 s, 1 min, 5 min
+  uint32_t base = R[random(N(R))];
+  return base * random(85, 116) / 100;    // +/-15% so it never feels clockwork
+}
+
+void pickEmotion() {
+  if (battCrit) return;
+  Emo shown = hasPending ? pendingEmo : emo;
+  if (shown != E_NEUTRAL)
+    queueEmotion(E_NEUTRAL, restTime());   // emotion finished: back to neutral and rest
+  else
+    queueEmotion(mood.pool[random(mood.n)], random(mood.durMin, mood.durMax));   // rest over: show one
+}
+
+// called when the clock screen ends: eyes open up again, neutral, then a normal rest
+void resumeEyes(uint32_t now) {
+  if (!battCrit) {
+    emo = E_NEUTRAL; hasPending = false;
+    nextEmo = now + restTime();
+  }
+  openCur = 0.03f;
+  blinkUntil = 0;
+  nextBlink = now + 2500; nextGaze = now + 1000;
+  dirty = true;
+}
+
+// ---------- DRAWING ----------
+void drawHeart(int cx, int cy, int r, uint16_t c) {
+  spr.fillCircle(cx - r, cy - r / 2, r, c);
+  spr.fillCircle(cx + r, cy - r / 2, r, c);
+  spr.fillTriangle(cx - r * 19 / 10, cy - r / 2 + r * 45 / 100,
+                   cx + r * 19 / 10, cy - r / 2 + r * 45 / 100,
+                   cx, cy + r * 19 / 10, c);
+}
+
+void drawStar(int cx, int cy, int r, uint16_t c) {
+  int w = max(1, r / 4);
+  spr.fillTriangle(cx, cy - r, cx - w, cy, cx + w, cy, c);
+  spr.fillTriangle(cx, cy + r, cx - w, cy, cx + w, cy, c);
+  spr.fillTriangle(cx - r, cy, cx, cy - w, cx, cy + w, c);
+  spr.fillTriangle(cx + r, cy, cx, cy - w, cx, cy + w, c);
+  spr.fillCircle(cx, cy, w, c);
+}
+
+void drawSpiral(int cx, int cy, uint16_t c, float ang) {
+  spr.fillCircle(cx, cy, S(30), c);
+  spr.fillCircle(cx, cy, S(23), TFT_BLACK);
+  spr.fillCircle(cx, cy, S(17), c);
+  spr.fillCircle(cx, cy, S(10), TFT_BLACK);
+  spr.fillCircle(cx, cy, S(4),  c);
+  spr.fillTriangle(cx, cy,
+                   cx + (int)(34 * cosf(ang)),        cy + (int)(34 * sinf(ang)),
+                   cx + (int)(34 * cosf(ang + 0.9f)), cy + (int)(34 * sinf(ang + 0.9f)),
+                   TFT_BLACK);   // rotating gap makes the rings look like they spin
+}
+
+void drawX(int cx, int cy, int r, uint16_t c) {
+  for (int d = -3; d <= 3; d++) {
+    spr.drawLine(cx - r + d, cy - r, cx + r + d, cy + r, c);
+    spr.drawLine(cx + r + d, cy - r, cx - r + d, cy + r, c);
+  }
+}
+
+void drawBattIcon() {
+  uint16_t col = battCrit ? 0xFA25 : 0xFFE0;
+  int x = 208, y = 120;
+  spr.drawRect(x, y, 22, 11, col);
+  spr.fillRect(x + 22, y + 3, 2, 5, col);
+  spr.fillRect(x + 2, y + 2, max(2, 18 * battPct / 100), 7, col);
+}
+
+void drawEyes() {
+  const Look& L = LOOKS[emo];
+  uint32_t ms = millis();
+  sf = 0.15f + 0.85f * openCur;
+  spr.fillSprite(TFT_BLACK);
+  int W = (int)(64 * L.scaleW);
+  int hFull = (int)(84 * L.scaleH * openCur);
+
+  for (int i = 0; i < 2; i++) {
+    int cx = (i == 0 ? 72 : 168) + (int)gazeX;
+    int cy = 62 + (int)gazeY;
+    if (L.shake) { cx += random(-L.shake, L.shake + 1); cy += random(-L.shake, L.shake + 1); }
+
+    switch (L.sp) {
+      case SP_HEART:  drawHeart(cx, cy, S(16), L.color); continue;
+      case SP_STAR:   drawStar(cx, cy, S(26 + (int)(4 * sinf(ms / 120.0f))), L.color); continue;
+      case SP_SPIRAL: drawSpiral(cx, cy, L.color, ms / 120.0f); continue;
+      case SP_X:      drawX(cx, cy, S(22), L.color); continue;
+      case SP_ASLEEP: spr.fillRoundRect(cx - W / 2, cy + 6, W, 6, 3, L.color); continue;
+      default: break;
+    }
+
+    int h = (L.wink && i == 1) ? 8 : max(6, hFull);
+    if (i == 1 && L.asym != 100) h = max(6, h * L.asym / 100);
+    spr.fillRoundRect(cx - W / 2, cy - h / 2, W, h, min(18, h / 2), L.color);
+
+    if (L.lid)   // flat top lid (suspicious, smug)
+      spr.fillRect(cx - W / 2 - 1, cy - h / 2 - 1, W + 2, h * L.lid / 100 + 1, TFT_BLACK);
+
+    if (L.tilt) {   // angry / sad slanted lids
+      int top = cy - h / 2 - 1, drop = h * 45 / 100;
+      int lx = cx - W / 2 - 1, rx = cx + W / 2 + 1;
+      bool right = (i == 0) == (L.tilt > 0);
+      spr.fillTriangle(lx, top, rx, top, right ? rx : lx, top + drop, TFT_BLACK);
+    }
+    if (L.arch) spr.fillCircle(cx, cy + h * 4 / 10, W * 6 / 10, TFT_BLACK);   // happy ^ shape
+
+    if (L.tear) {
+      int tx = cx + (i == 0 ? -16 : 16);
+      int ty = cy + h / 2 - 6 + (int)((ms / 30) % 30);
+      spr.fillCircle(tx, ty, 4, 0x7DFF);
+      spr.fillTriangle(tx - 4, ty, tx + 4, ty, tx, ty - 9, 0x7DFF);
+    }
+  }
+
+  if (L.sp == SP_ASLEEP) {
+    int ph = (ms / 500) % 3;
+    spr.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    spr.drawString("z", 196, 52 - ph * 4, 2);
+    spr.drawString("Z", 208, 30 - ph * 4, 4);
+  }
+  if (statusMsg[0]) {
+    spr.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    spr.drawCentreString(statusMsg, 120, 118, 2);
+  }
+  if (!timeValid && !statusMsg[0]) {          // hint until the first sync
+    spr.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    spr.drawCentreString("hold left button to set time", 120, 122, 1);
+  }
+  if (battLow) drawBattIcon();
+  spr.pushSprite(0, 0);
+}
+
+// ---------- CLOCK SCREEN ----------
+const char* DAYS[]   = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+const char* MONTHS[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+void drawClock() {
+  struct tm tm;
+  if (!getLocalTime(&tm, 0)) return;
+  int h12 = tm.tm_hour % 12; if (h12 == 0) h12 = 12;
+  char hm[8], date[20];
+  snprintf(hm, sizeof(hm), "%d:%02d", h12, tm.tm_min);
+  snprintf(date, sizeof(date), "%s, %s %d", DAYS[tm.tm_wday], MONTHS[tm.tm_mon], tm.tm_mday);
+  const char* ap = (tm.tm_hour < 12) ? "AM" : "PM";
+
+  spr.fillSprite(TFT_BLACK);
+  spr.setTextColor(0x07FF, TFT_BLACK);
+  int w  = spr.textWidth(hm, 7);
+  int pw = spr.textWidth(ap, 4);
+  int x0 = (240 - (w + 8 + pw)) / 2;
+  spr.drawString(hm, x0, 20, 7);                    // big 7-segment digits
+  spr.setTextColor(0xBDF7, TFT_BLACK);
+  spr.drawString(ap, x0 + w + 8, 42, 4);
+  spr.setTextColor(TFT_WHITE, TFT_BLACK);
+  spr.drawCentreString(date, 120, 86, 4);
+  if (battLow) drawBattIcon();
+  spr.pushSprite(0, 0);
+}
+
+// the clock shows for the whole minute at :00, :05, :10 ...
+bool wantClock() {
+  if (!timeValid || battCrit) return false;
+  struct tm tm;
+  if (!getLocalTime(&tm, 0)) return false;
+  return (tm.tm_min % 5) == 0;
+}
+
+// ---------- TIME SYNC ----------
+void onNtp(struct timeval*) { ntpDone = true; }
+
+void syncTime() {
+  DBG("sync: starting\n");
+  screenOn = true; applyBacklight();
+  statusMsg = "connecting..."; drawEyes();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(100);
+  DBG("sync: wifi %s\n", WiFi.status() == WL_CONNECTED ? "connected" : "FAILED");
+
+  bool ok = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    statusMsg = "getting time..."; drawEyes();
+    ntpDone = false;
+    configTzTime(TZ_INFO, "pool.ntp.org", "time.google.com");
+    t0 = millis();
+    while (!ntpDone && millis() - t0 < 10000) delay(100);
+    ok = ntpDone;
+    DBG("sync: ntp %s\n", ok ? "ok" : "FAILED");
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);                       // radio fully off again
+
+  if (ok) { timeValid = true; statusMsg = "synced"; }
+  else    { statusMsg = "sync failed"; }
+  statusUntil = millis() + 2000;
+  updateSchedule();
+  queueEmotion(ok ? E_HAPPY : E_SAD, 3000);
+  dirty = true;
+}
+
+// ---------- BUTTONS ----------
+void handleButtons() {
+  uint32_t now = millis();
+
+  // left: short = screen toggle, long = sync
+  static uint32_t downAt = 0;
+  static bool longDone = false;
+  bool down = digitalRead(PIN_BTN) == LOW;
+  if (down && !downAt) { downAt = now; longDone = false; }
+  else if (down && !longDone && now - downAt >= LONG_PRESS_MS) { longDone = true; syncTime(); }
+  else if (!down && downAt) {
+    if (!longDone && now - downAt > 30) {
+      screenOn = !screenOn; applyBacklight(); dirty = true;
+      DBG("screen %s\n", screenOn ? "on" : "off");
+    }
+    downAt = 0;
+  }
+
+  // right: next emotion
+  static bool was2 = false;
+  static uint32_t last2 = 0;
+  bool down2 = digitalRead(PIN_BTN2) == LOW;
+  if (down2 && !was2 && screenOn && !showingClock && now - last2 > 200) {
+    last2 = now;
+    Emo base = hasPending ? pendingEmo : emo;
+    queueEmotion((Emo)((base + 1) % E_COUNT), 6000);
+  }
+  was2 = down2;
+}
+
+// ---------- SETUP / LOOP ----------
+void setup() {
+  if (DEBUG_SERIAL) Serial.begin(115200);
+  setCpuFrequencyMhz(80);
+  gpio_hold_dis((gpio_num_t)PIN_BL);          // release the hold after deep sleep
+  gpio_deep_sleep_hold_dis();
+  setenv("TZ", TZ_INFO, 1); tzset();          // timezone must be set again after wake
+  pinMode(PIN_BTN, INPUT_PULLUP);
+  pinMode(PIN_BTN2, INPUT);                   // GPIO 35 has no internal pull-up; board has one
+  tft.init();
+  tft.setRotation(1);                         // 240x135 landscape
+  tft.fillScreen(TFT_BLACK);
+  ledcAttach(PIN_BL, 5000, 8);
+  spr.setColorDepth(16);
+  spr.createSprite(240, 135);
+  sntp_set_time_sync_notification_cb(onNtp);
+  randomSeed(esp_random());
+  updateBattery();
+  updateSchedule();
+  uint32_t now = millis();
+  nextBlink = now + 2000; nextGaze = now + 1500;
+  nextEmo = now + (FAST_TEST ? 5000 : 15000);
+  DBG("boot ok, timeValid=%d\n", timeValid);
+}
+
+void loop() {
+  handleButtons();
+  uint32_t now = millis();
+
+  if (now - lastCheck > 30000) { lastCheck = now; updateBattery(); updateSchedule(); }
+  if (sleepAt && now > sleepAt) goToSleep();
+  if (!screenOn) { delay(50); return; }
+
+  // clock screen: whole minute at :00, :05, :10 ...
+  static uint32_t lastPoll = 0;
+  if (now - lastPoll > 250) {
+    lastPoll = now;
+    bool want = wantClock();
+    if (want != showingClock) {
+      showingClock = want;
+      dirty = true;
+      DBG("clock screen %s\n", want ? "on" : "off");
+      if (!want) resumeEyes(now);
+    }
+  }
+  if (showingClock) {
+    if (dirty) { drawClock(); dirty = false; }
+    delay(100);
+    return;
+  }
+
+  if (statusUntil && now > statusUntil) { statusUntil = 0; statusMsg = ""; dirty = true; }
+  if (now >= nextEmo) pickEmotion();
+
+  // blinking (slow and heavy when sleepy or low on battery)
+  if (now >= nextBlink) {
+    blinkUntil = now + (mood.slow ? 600 : 140);
+    nextBlink = now + random(mood.blinkMin, mood.blinkMax);
+  }
+  openTarget = (now < blinkUntil) ? 0.03f : mood.maxOpen;
+
+  // swap emotion while the eyes are closed
+  if (hasPending && openCur < 0.1f) {
+    emo = pendingEmo; hasPending = false;
+    nextGaze = now; dirty = true;
+    DBG("emotion: %s\n", EMO_NAMES[emo]);
+  }
+
+  // looking around (amount depends on emotion and mood)
+  if (now >= nextGaze) {
+    float s = (mood.slow ? 0.4f : 1.0f) * LOOKS[emo].gaze;
+    int bias = LOOKS[emo].bias;
+    if (random(5) == 0) { gazeTX = bias; gazeTY = 0; }          // occasionally re-center
+    else { gazeTX = bias + random(-36, 37) * s; gazeTY = random(-8, 9) * s; }
+    nextGaze = now + random(1000, 3000);
+  }
+
+  // ease toward targets
+  float po = openCur, px = gazeX, py = gazeY;
+  openCur += (openTarget - openCur) * 0.5f;
+  if (fabsf(openTarget - openCur) < 0.02f) openCur = openTarget;
+  gazeX += (gazeTX - gazeX) * 0.3f;
+  gazeY += (gazeTY - gazeY) * 0.3f;
+  if (fabsf(gazeTX - gazeX) < 0.5f) gazeX = gazeTX;
+  if (fabsf(gazeTY - gazeY) < 0.5f) gazeY = gazeTY;
+  if (po != openCur || px != gazeX || py != gazeY) dirty = true;
+
+  // emotions with continuous motion redraw on a timer
+  const Look& L = LOOKS[emo];
+  static uint32_t lastAnim = 0;
+  bool animated = L.tear || L.shake || L.sp == SP_STAR || L.sp == SP_SPIRAL || L.sp == SP_ASLEEP;
+  uint32_t period = (L.sp == SP_ASLEEP) ? 500 : 33;
+  if (animated && now - lastAnim >= period) { lastAnim = now; dirty = true; }
+
+  if (dirty) { drawEyes(); dirty = false; }
+  delay(33);
+}
